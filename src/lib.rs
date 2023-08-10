@@ -52,11 +52,17 @@ pub enum CoroutineResult<YIELD, RET> {
 struct UserData<VALUE, YIELD, RET, DATA, A: Allocator> {
     routine: *mut dyn Fn(CoroutineRef<VALUE, YIELD, RET, DATA, A>) -> RET,
     allocator: A,
+    values: Option<VALUE>,
+    yields: Option<YIELD>,
+    returns: Option<RET>,
+    returned: bool,
     data: DATA,
 }
 
+
 pub struct CoroutineRef<VALUE, YIELD, RET, DATA, A: Allocator> {
-    co: *const mco_coro,
+    // corotine ref cannot be send
+    co: *mut mco_coro,
     _d: PhantomData<(VALUE, YIELD, RET, DATA, A)>,
 }
 
@@ -100,7 +106,7 @@ extern "C" fn coroutine_wrapper<VALUE, YIELD, RET, DATA, A: Allocator>(co: *cons
             .unwrap();
 
         let r = CoroutineRef {
-            co: co,
+            co: co as *mut mco_coro,
             _d: PhantomData,
         };
         let result = (data.routine.as_ref().unwrap())(r);
@@ -141,10 +147,15 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Coroutine<VALUE, YIELD, RET, DATA, A
             ud.write(UserData {
                 routine: func as *mut dyn Fn(CoroutineRef<VALUE, YIELD, RET, DATA, A>) -> RET,
                 allocator: allocator,
+                yields: None,
+                values: None,
+                returns: None,
+                returned: false,
                 data: user_data,
             });
 
             desc.user_data = ud as _;
+            desc.allocator_data = ud as _;
             desc.malloc_cb = co_malloc::<VALUE, YIELD, RET, DATA, A>;
             desc.free_cb = co_free::<VALUE, YIELD, RET, DATA, A>;
 
@@ -170,7 +181,7 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Coroutine<VALUE, YIELD, RET, DATA, A
             None
         } else {
             Some(CoroutineRef {
-                co: p,
+                co: p as *mut mco_coro,
                 _d: PhantomData,
             })
         }
@@ -188,7 +199,7 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Coroutine<VALUE, YIELD, RET, DATA, A
 
     /// return none if coroutine returned
     #[inline]
-    pub fn resume(&self, value: VALUE) -> Option<CoroutineResult<YIELD, RET>> {
+    pub fn resume(&mut self, value: VALUE) -> Option<CoroutineResult<YIELD, RET>> {
         unsafe {
             let current_status = mco_status(self.co);
             if current_status == mco_state::MCO_DEAD {
@@ -199,15 +210,15 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Coroutine<VALUE, YIELD, RET, DATA, A
                 return Some(CoroutineResult::Error("resume on runnig coroutine"));
             }
 
-            let re = mco_push(
-                self.co,
-                &value as *const VALUE as _,
-                core::mem::size_of::<VALUE>(),
-            );
+            let data = (mco_get_user_data(self.co) as *mut UserData<VALUE, YIELD, RET, DATA, A>)
+                .as_mut()
+                .unwrap_unchecked();
 
-            if re != mco_result::MCO_SUCCESS {
-                return Some(CoroutineResult::Error(error_to_str(re)));
+            if data.returned{
+                return None;
             }
+
+            data.values = Some(value);
 
             let re = mco_resume(self.co);
 
@@ -215,34 +226,20 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Coroutine<VALUE, YIELD, RET, DATA, A
                 return Some(CoroutineResult::Error(error_to_str(re)));
             }
 
-            if mco_status(self.co) == mco_state::MCO_DEAD {
-                let mut value: RET = core::mem::zeroed();
+            if data.yields.is_none() {
+                let mut value = None;
+                core::mem::swap(&mut value, &mut data.returns);
 
-                let re = mco_pop(
-                    self.co,
-                    &mut value as *mut RET as *const u8,
-                    core::mem::size_of::<RET>(),
-                );
+                data.returned = true;
 
-                if re != mco_result::MCO_SUCCESS {
-                    return Some(CoroutineResult::Error(error_to_str(re)));
-                }
+                return Some(CoroutineResult::Return(value.unwrap()));
 
-                return Some(CoroutineResult::Return(value));
             } else {
-                let mut value: YIELD = core::mem::zeroed();
+                let mut value = None;
 
-                let re = mco_pop(
-                    self.co,
-                    &mut value as *mut YIELD as *const u8,
-                    core::mem::size_of::<RET>(),
-                );
+                core::mem::swap(&mut value, &mut data.yields);
 
-                if re != mco_result::MCO_SUCCESS {
-                    return Some(CoroutineResult::Error(error_to_str(re)));
-                }
-
-                return Some(CoroutineResult::Yield(value));
+                return Some(CoroutineResult::Yield(value.unwrap()));
             }
         }
     }
@@ -251,26 +248,11 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Coroutine<VALUE, YIELD, RET, DATA, A
 impl<VALUE, YIELD, RET, DATA, A: Allocator> Drop for Coroutine<VALUE, YIELD, RET, DATA, A> {
     fn drop(&mut self) {
         unsafe {
-            core::ptr::drop_in_place(self.user_data() as *const DATA as *mut DATA);
-            mco_destroy(self.co);
-        }
-    }
-}
-
-impl<VALUE: Default, YIELD, RET, DATA> core::future::Future for Coroutine<VALUE, YIELD, RET, DATA> {
-    type Output = Result<RET, &'static str>;
-
-    fn poll(
-        self: core::pin::Pin<&mut Self>,
-        _cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        match self.resume(Default::default()) {
-            Some(r) => match r {
-                CoroutineResult::Return(r) => core::task::Poll::Ready(Ok(r)),
-                CoroutineResult::Error(e) => core::task::Poll::Ready(Err(e)),
-                _ => core::task::Poll::Pending,
-            },
-            None => return core::task::Poll::Pending,
+            if !self.co.is_null(){
+                core::ptr::drop_in_place(self.user_data() as *const DATA as *mut DATA);
+                mco_destroy(self.co);
+            }
+            
         }
     }
 }
@@ -279,44 +261,38 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> CoroutineRef<VALUE, YIELD, RET, DATA
     #[inline]
     pub fn yield_(&self, yield_value: YIELD) -> VALUE {
         unsafe {
-            let value: VALUE = core::mem::zeroed();
-            mco_pop(
-                self.co,
-                &value as *const VALUE as _,
-                core::mem::size_of::<VALUE>(),
-            );
+            // read from values
+            let data = (mco_get_user_data(self.co) as *mut UserData<VALUE, YIELD, RET, DATA, A>)
+                .as_mut()
+                .unwrap_unchecked();
 
-            mco_push(
-                self.co,
-                &yield_value as *const YIELD as _,
-                core::mem::size_of::<YIELD>(),
-            );
+            let mut value = None;
+            core::mem::swap(&mut value, &mut data.values);
+            let value = value.unwrap_unchecked();
+
+            data.yields = Some(yield_value);
 
             mco_yield(self.co);
-
-            core::mem::forget(yield_value);
 
             return value;
         }
     }
 
     #[inline]
-    pub fn return_(&self, value: RET) {
+    pub fn return_(&self, ret: RET) {
         unsafe {
-            let v: VALUE = core::mem::zeroed();
-            mco_pop(
-                self.co,
-                &v as *const VALUE as _,
-                core::mem::size_of::<VALUE>(),
-            );
+            // read from values
+            let data = (mco_get_user_data(self.co) as *mut UserData<VALUE, YIELD, RET, DATA, A>)
+                .as_mut()
+                .unwrap_unchecked();
 
-            mco_push(
-                self.co,
-                &value as *const RET as _,
-                core::mem::size_of::<RET>(),
-            );
+            let mut value = None;
+            core::mem::swap(&mut value, &mut data.values);
+            let _value = value.unwrap_unchecked();
 
-            core::mem::forget(value);
+            data.returns = Some(ret);
+
+            mco_yield(self.co);
         }
     }
 
@@ -347,4 +323,79 @@ fn error_to_str(e: mco_result) -> &'static str {
         mco_result::MCO_STACK_OVERFLOW => "Stack overflow",
         mco_result::MCO_SWITCH_CONTEXT_ERROR => "Switch context error",
     }
+}
+
+impl<YIELD: Clone, RET: Clone> Clone for CoroutineResult<YIELD, RET> {
+    fn clone(&self) -> Self {
+        match self {
+            CoroutineResult::Error(e) => CoroutineResult::Error(e),
+            CoroutineResult::Return(r) => CoroutineResult::Return(r.clone()),
+            CoroutineResult::Yield(y) => CoroutineResult::Yield(y.clone()),
+        }
+    }
+}
+
+impl<YIELD: PartialEq, RET: PartialEq> PartialEq for CoroutineResult<YIELD, RET> {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            CoroutineResult::Error(e) => {
+                if let CoroutineResult::Error(b) = other {
+                    return e.eq(b);
+                }
+            }
+            CoroutineResult::Return(r) => {
+                if let CoroutineResult::Return(b) = other {
+                    return r.eq(b);
+                }
+            }
+            CoroutineResult::Yield(y) => {
+                if let CoroutineResult::Yield(b) = other {
+                    return y.eq(b);
+                }
+            }
+        };
+
+        return false;
+    }
+}
+
+#[cfg(feature = "std")]
+impl<YIELD: core::fmt::Debug, RET: core::fmt::Debug> core::fmt::Debug
+    for CoroutineResult<YIELD, RET>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CoroutineResult::Error(e) => f.write_fmt(format_args!("CoroutineResult::Error({})", e)),
+            CoroutineResult::Return(r) => {
+                f.write_fmt(format_args!("CoroutineResult::Return({:?})", r))
+            }
+            CoroutineResult::Yield(y) => {
+                f.write_fmt(format_args!("CoroutineResult::Yield({:?})", y))
+            }
+        }
+    }
+}
+
+#[test]
+fn test_simple_coroutine() {
+    let mut co = Coroutine::new(
+        |co| {
+            for i in 0..8u32 {
+                let v = co.yield_(i);
+                assert!(v == i);
+            }
+            return 66.98f64;
+        },
+        (),
+    )
+    .expect("Coroutine creation failed");
+
+    for i in 0..8u32 {
+        let v = co.resume(i);
+        assert!(v == Some(CoroutineResult::Yield(i)))
+    }
+
+    let v = co.resume(8);
+    assert!(v == Some(CoroutineResult::Return(66.98)));
+    assert!(co.resume(0).is_none());
 }
