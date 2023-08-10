@@ -43,6 +43,9 @@ pub struct Coroutine<VALUE, YIELD, RET, DATA, A: Allocator> {
     _d: PhantomData<(VALUE, YIELD, RET, DATA, A)>,
 }
 
+// coroutine can be send to another thread
+unsafe impl<VALUE, YIELD, RET, DATA, A:Allocator> Send for Coroutine<VALUE, YIELD, RET, DATA, A>{}
+
 pub enum CoroutineResult<YIELD, RET> {
     Yield(YIELD),
     Return(RET),
@@ -335,6 +338,27 @@ impl<YIELD: Clone, RET: Clone> Clone for CoroutineResult<YIELD, RET> {
     }
 }
 
+impl<YIELD: Copy, RET:Copy> Copy for CoroutineResult<YIELD, RET>{}
+
+impl<YIELD:core::hash::Hash, RET:core::hash::Hash> core::hash::Hash for CoroutineResult<YIELD, RET>{
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        match self{
+            Self::Error(e) => {
+                state.write_u8(0);
+                e.hash(state);
+            },
+            Self::Return(r) => {
+                state.write_u8(1);
+                r.hash(state);
+            },
+            Self::Yield(y) => {
+                state.write_u8(2);
+                y.hash(state);
+            }
+        }
+    }
+}
+
 impl<YIELD: PartialEq, RET: PartialEq> PartialEq for CoroutineResult<YIELD, RET> {
     fn eq(&self, other: &Self) -> bool {
         match self {
@@ -358,6 +382,8 @@ impl<YIELD: PartialEq, RET: PartialEq> PartialEq for CoroutineResult<YIELD, RET>
         return false;
     }
 }
+
+impl<YIELD:Eq, RET:Eq> Eq for CoroutineResult<YIELD, RET>{}
 
 #[cfg(feature = "std")]
 impl<YIELD: core::fmt::Debug, RET: core::fmt::Debug> core::fmt::Debug
