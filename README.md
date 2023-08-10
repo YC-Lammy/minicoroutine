@@ -22,3 +22,6 @@ This crate currently supports the following targets:
 # Panic
 Panics are not supported by this crate, catch unwind will not be able to catch panics invoked inside the coroutine.
 use the yield api to pass on any errors instead.
+
+# Yield from anywhere
+You can yield the current running coroutine from anywhere without having to pass pointers around, to do this just use Coroutine::running().unwrap().yield_(value).

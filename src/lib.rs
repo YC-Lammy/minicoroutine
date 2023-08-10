@@ -249,7 +249,7 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> Drop for Coroutine<VALUE, YIELD, RET
     fn drop(&mut self) {
         unsafe {
             if !self.co.is_null(){
-                core::ptr::drop_in_place(self.user_data() as *const DATA as *mut DATA);
+                core::ptr::drop_in_place(mco_get_user_data(self.co) as *mut UserData<VALUE, YIELD, RET, DATA, A>);
                 mco_destroy(self.co);
             }
             
@@ -279,7 +279,7 @@ impl<VALUE, YIELD, RET, DATA, A: Allocator> CoroutineRef<VALUE, YIELD, RET, DATA
     }
 
     #[inline]
-    pub fn return_(&self, ret: RET) {
+    fn return_(&self, ret: RET) {
         unsafe {
             // read from values
             let data = (mco_get_user_data(self.co) as *mut UserData<VALUE, YIELD, RET, DATA, A>)
